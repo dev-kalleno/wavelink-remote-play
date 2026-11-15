@@ -1,117 +1,113 @@
-# steam-audio-relay
+# wavelink-remote-play
 
-Steam Remote Play streams the sound of exactly one Windows playback device. If you use Elgato Wave Link, that device is the "System" channel. So on your Steam Deck, phone or TV you get system sounds and nothing else: no game, no browser, no voice chat.
+You stream games from your PC with Steam Remote Play, to a Steam Deck, a phone or the TV in the living room. You also use Elgato Wave Link on that PC. On the other end you hear system sounds and little else: no game, no browser, no voice chat. Or you hear everything, but only in stereo.
 
-This tool fixes that. It sits in the tray, notices when a Remote Play stream starts, and plays all your other Wave Link channels into the device Steam records. When the stream ends, it stops. You don't have to touch your Wave Link mixes.
+This small Windows tool fixes that. It sits in the tray and notices when a stream starts. While the stream runs, your Wave Link channels play into the stream, games in full surround. When the stream ends, everything goes back to where it was. You don't have to change your Wave Link mixes.
 
 ![The window](docs/screenshot.png)
 
+This is a hobby project. It is not made or endorsed by Elgato or Valve.
+
 ## Quick start
 
-1. **Get the tool.** Download the zip from the [Releases](https://github.com/dev-kalleno/steam-audio-relay/releases/latest) page, unpack it anywhere and start `steam-audio-relay.exe`. The exe isn't signed, so Windows SmartScreen will probably ask once ("More info", then "Run anyway"). If you'd rather not run a stranger's exe, [build it yourself](#build-it-yourself) with one command.
-2. **Wave Link: keep "System" as the Windows default.** In Wave Link's settings, under audio devices, there is a lock for the system devices. Switch it on and set the output device to "System". Without the lock, Steam changes the Windows default to its own "Steam Streaming Speakers" when a client connects, and every program that has no Wave Link channel goes silent.
-3. **In the tool: check the target and switch on "Start with Windows".** "Plays into" should show your Wave Link "System" device. It is picked for you if there is only one device with that name.
+1. **Get the tool.** Download the zip from the [Releases](https://github.com/dev-kalleno/wavelink-remote-play/releases/latest) page, unpack it anywhere and start `wavelink-remote-play.exe`. The exe isn't signed, so Windows SmartScreen will probably ask once ("More info", then "Run anyway"). If you'd rather not run a stranger's exe, [build it yourself](#build-it-yourself) with one command.
+2. **Take Steam out of your Wave Link channels.** Open Wave Link and look at the programs listed in each channel, usually it is "System". If Steam is in there, remove it. This one entry is the reason Steam only streams that channel, see [Why this happens](#why-this-happens).
+3. **Switch off the device lock in Wave Link.** In Wave Link's settings, under audio devices, there is a lock that keeps the Windows output device on "System". With the lock on, the stream works but stays stereo.
+4. **In the tool, switch on "Start with Windows".** The channels are all switched on already.
 
-That's it. Leave Steam's audio channel setting for Remote Play on Automatic (see [below](#if-something-is-wrong) if you changed it). Connect from your Deck or phone. Within about a second the line under the title turns green and says "Relaying 6 devices" (or however many channels you have).
+That's it. Connect from your Deck or phone. Within about a second the line under the title turns green.
+
+For surround, the device you stream to has to ask for it: set the audio channels in Steam's Remote Play settings there to 5.1 or 7.1. And the game has to output surround, of course.
 
 ## The window
 
 | Part | What it does |
 | --- | --- |
-| Start / Stop | Switches the relay on and off by hand. It starts by itself when you open the tool. |
-| Stream volume | One row per Wave Link channel, with a mute button, a slider and a level meter inside the slider. This sets how loud that channel is **in the stream**. It changes nothing in Wave Link. |
-| Refresh | Reads the device list again, for example after you added a channel in Wave Link. |
-| Plays into | The device Steam records. Normally "System". |
-| Stream level | The finished mix going to Steam. If this moves, the tool is doing its job. |
-| Full volume in the stream | The stream gets full level even if you turned a channel down in Wave Link. See [Volume](#volume). On by default. |
-| Only while streaming | Relay only while a Remote Play stream is running. On by default. Off means it relays all the time. |
+| Start / Stop | Switches the tool on and off by hand. It starts by itself when you open it. |
+| In the stream | One switch per Wave Link channel. On means the other side hears this channel. |
+| "direct: ..." on a row | The programs of this channel that are playing straight into the stream right now. |
+| Refresh | Reads the channel list again, for example after you added a channel in Wave Link. |
+| Keep the sound on at the PC | For when someone sits at the PC during the stream. The stream is stereo then, not surround. Off by default. |
 | Start with Windows | Starts the tool with Windows, minimized to the tray. No admin rights needed. |
 | Big Picture | Opens Steam Big Picture on the PC when a stream starts, reopens it after you quit a game, and closes it 20 seconds after the stream has ended. Off by default. |
+| A yellow line under the title | Something in your setup keeps the stream stereo, and what to change. See [If something is wrong](#if-something-is-wrong). |
 
 Closing the window only hides it. The tool keeps running in the tray, and "Exit" in the tray icon's menu quits it.
 
-## Volume
+## What happens during a stream
 
-There are two places with a "Game" slider, and they do different things:
+1. A client connects. Steam starts recording its own playback device, "Steam Streaming Speakers", with as many channels as the client asked for.
+2. The programs in your switched-on channels are pointed at that device. A game now plays straight into the stream, in stereo, 5.1 or 7.1, whatever the stream has. At the PC these programs are silent meanwhile.
+3. Some things can't be pointed anywhere: a program that has its output device set in its own settings (Discord's voice output often is), or a hardware input like a capture card. Whatever is still playing on a channel is copied into the stream instead, in stereo.
+4. 20 seconds after the stream has ended, every program is pointed back at its channel.
 
-| Control | Changes the stream | Changes what you hear at the PC |
-| --- | --- | --- |
-| Slider or mute in this tool | yes | no |
-| Channel fader in Wave Link | no (yes if "Full volume in the stream" is off) | yes |
-| Levels inside a Wave Link mix (Personal Mix, Stream Mix) | no | yes |
-
-So you can turn the game down at your desk to hear voice chat, and the TV in the living room still gets it at full level. That is what "Full volume in the stream" is for: the tool reads how far each channel is turned down in Wave Link and turns it back up by the same amount.
-
-I measured this with a test tone on the Game channel. With the Wave Link fader at 100 %, 50 % and 20 %, the stream got exactly the same level each time.
-
-Two details:
-
-- The correction goes up to +30 dB. A fader that is almost at zero will still be quieter in the stream.
-- I haven't tested a channel that is muted in Wave Link. It is probably silent in the stream too.
-
-## Good to know
-
-- **Stereo only.** The "System" device is a stereo device, so the stream is stereo. I looked for a way to get surround through and didn't find one.
-- **Starting a game from the client's library** makes Steam end the stream and start a new one 5 to 10 seconds later. The relay pauses for that gap and comes back by itself.
-- **About 50 ms delay** is added to the relayed channels.
-- **At the PC, relayed channels play twice while a stream runs.** The relay plays them into "System", and "System" is usually part of the mix on your headphones too. The stream gets everything once. It only matters if someone sits at the PC while you stream from it.
-- **Steam Broadcast** records the same device, so the relay runs during a broadcast as well.
-- **Without Wave Link** the window lists every other playback device, muted, and you unmute the ones you want. I haven't tested that setup.
-
-## If something is wrong
-
-**Connected, but the tool keeps saying "Waiting for a Remote Play stream".**
-The target is not the device Steam records. While a stream runs, look into `Steam\logs\streaming_log.txt` for a line like this and pick that device under "Plays into":
-
-```
-[System Windows] Recording on device: System (Elgato Wave XLR Pro)
-```
-
-**It says "Relaying", but a channel is missing in the stream.**
-Check that channel's row in the tool: is it muted or turned down, and does its meter move while the program plays? If the meter stays flat, the program isn't playing on that Wave Link channel. If the channel has no row at all, click "Refresh".
-
-**A game started through the stream is silent, everything else works.**
-This only happens if you changed Steam's audio channels for Remote Play to surround. I had set 7.1 on the PC and on the Deck because it sounded like a good idea. Steam then sends a freshly started game to its 8-channel "Steam Streaming Speakers", Wave Link moves it to a stereo channel, and the game ends up with an 8-channel stream on a stereo device. That produces silence and no error. Set it back to Automatic (or Stereo) on both sides and it works. The stream is stereo anyway, so you lose nothing. A game that is already running when you connect doesn't have this problem.
-
-**Programs without a Wave Link channel go silent when a client connects.**
-That is step 2 of the quick start. The lock is off and Steam has changed the Windows default device.
-
-**Steam Link VR or SteamVR has no sound.**
-Not this tool's fault, but it happened to me along the way: Wave Link's device visibility list had hidden "Steam Streaming Microphone", and SteamVR refuses to start audio without it. Switch it back on in Wave Link's settings.
-
-**Anything else.**
-The tool writes `steam-audio-relay.log` next to the exe. It says when a stream was detected, which devices are relayed and which were skipped and why.
-
-## How it works
-
-Wave Link gives every channel its own Windows playback device and routes your programs to them. Steam records only the Windows default device, which is "System", so the other channels never reach the stream.
+Nothing in Wave Link's own channel lists is changed. The tool uses the same Windows setting Wave Link uses, the one behind "App volume and device preferences", and puts it back afterwards.
 
 ```mermaid
 flowchart LR
-  G[Game] --> R((relay))
-  B[Browser] --> R
-  V[Voice chat] --> R
-  R --> S[System]
-  O[everything else] --> S
-  S --> ST[Steam Remote Play]
+  G[Game, on the Game channel] -->|pointed at| S[Steam Streaming Speakers]
+  D[Discord voice, on Voice chat] -->|copied, stereo| S
+  O[Programs without a channel] --> S
+  S --> R[Steam Remote Play]
 ```
 
-The tool copies what the other channel devices are playing (WASAPI loopback), mixes it and plays the result into "System". It takes the channels before Wave Link's mixer, so nothing can loop back into itself.
+## Good to know
 
-To know when to run, it asks Windows twice a second whether `steam.exe` is recording the target device right now. That is the case from the moment a client connects until it disconnects, also while you alt-tab or switch between desktop and game. The relay starts about a second after you connect and pauses 3 seconds after Steam stops recording. I logged this for 25 minutes next to Steam's own log, with several connects, disconnects, alt-tabs and game starts, and every change matched. If Windows can't be asked, the tool falls back to reading Steam's streaming log.
+- **Someone at the PC?** Switch on "Keep the sound on at the PC". Then nothing is pointed anywhere, everything is copied, and the PC keeps its sound. The price is a stereo stream. That is the right mode for Remote Play Together or a Steam Broadcast, where you play at the PC yourself.
+- **Wave Link sometimes takes a program back.** When a program appears on or disappears from one of its channels, Wave Link puts the programs it knows back on their channels. The tool notices within half a second and points them at the stream again. You may hear a short dropout. In an 80 minute session I didn't notice any, I only saw it when I restarted the tool.
+- **A game that keeps running after the stream** was started with the stream's channel layout and is then back on a stereo channel. I have seen games go silent when 8 channels meet a stereo device. If that happens at the PC, restart the game. I haven't tried this direction myself.
+- **Starting a game from the client's library** makes Steam end the stream and start a new one 5 to 10 seconds later. The tool pauses for that gap and picks up again.
+- **Volume.** A program that plays straight into the stream arrives at its own volume, Wave Link's fader for the channel doesn't apply. Copied channels arrive at full level too: the tool reads how far a channel is turned down in Wave Link and undoes it, up to +30 dB. So you can have the game quiet at your desk and loud on the TV.
+- **Copied audio is about 50 ms late.** Audio that plays straight into the stream is not delayed.
+- **Without Wave Link** the window lists every playback device, switched off, and you pick the ones you want. I haven't tested that.
 
-<details>
-<summary>Things that did not make Steam record anything other than "System"</summary>
+## If something is wrong
 
-Listed here so you don't have to try them yourself:
+**Yellow line: "Steam sits in Wave Link's "System" channel".**
+Step 2 of the quick start. Remove Steam from that channel in Wave Link, then reconnect.
 
-- sending a Wave Link mix to "Steam Streaming Speakers"
-- changing the Windows default device
-- editing `DefaultAudioDevice` in Steam's `localconfig.vdf` (Steam writes it back at start)
-- reinstalling Steam's streaming audio drivers
-- un-hiding Steam's devices in Wave Link
+**Yellow line: "Steam records "System": stereo only".**
+Step 3 of the quick start. The lock in Wave Link is on. Switch it off, then reconnect.
 
-</details>
+**Yellow line: "Windows' default output is still Steam's device".**
+Steam switches the Windows output device to its own while streaming and switches it back afterwards. If Steam crashed in between, it stays. Set your output device back in the Windows sound settings.
+
+**The stream is stereo, and there is no yellow line.**
+Check the audio channel setting in Steam's Remote Play settings on the device you stream to, and the speaker setting in the game.
+
+**A program is missing in the stream.**
+Is its channel switched on in the tool? If yes, look into the log.
+
+**Anything else.**
+The tool writes `wavelink-remote-play.log` next to the exe. It says when a stream was detected, which device Steam records and with how many channels, which programs were pointed at the stream and which channels are copied. Steam's side is in `Steam\logs\streaming_log.txt`, look for `Recording on device`.
+
+## Why this happens
+
+Steam Remote Play records one playback device. When a client connects, Steam makes its own "Steam Streaming Speakers" the Windows default device, and records the default device. On a plain PC every program plays on the default device, so everything is in the stream.
+
+Wave Link gets in the way in three places.
+
+1. **Wave Link gives every channel its own playback device** and assigns your programs to them. A game on the Game channel plays on Wave Link's "Game" device, not on the default device. Steam never hears it. This is what the tool takes care of.
+2. **Steam itself can end up in a channel.** Wave Link assigns programs with a Windows setting that gives one program its own default device. If Steam is listed in the "System" channel, Windows tells Steam that "System" is the default device, whatever the real default is. Steam then records "System" and nothing else, in stereo. It took me over a month to find this one. Everything I tried on Steam's side bounced off, because Steam was doing exactly what Windows told it.
+3. **The device lock** puts the default device back on "System" the moment Steam changes it. Steam then records "System" too.
+
+You can see which case you are in. While a stream runs, Steam writes this into `Steam\logs\streaming_log.txt`:
+
+```
+[System Windows] Recording on device: System (Elgato Wave XLR Pro)
+Initializing audio with 2 channels and 48000 samples/sec
+```
+
+That is case 2 or 3. This is how it should look:
+
+```
+[System Windows] Recording on device: Lautsprecher (Steam Streaming Speakers)
+Initializing audio with 8 channels and 48000 samples/sec
+```
+
+("Lautsprecher" because my Windows is German. Yours will say "Speakers".)
+
+If you don't care about surround, you don't strictly need this tool once Steam records its own device: you can add "Steam Streaming Speakers" as an extra output to one of your Wave Link mixes. Everything in that mix should then reach the stream, in stereo. I haven't gone back to check that.
 
 ## Build it yourself
 
@@ -121,33 +117,40 @@ Everything is in one file, `relay.cs`, with no dependencies. `build.cmd` compile
 .\build.cmd
 ```
 
-You get `steam-audio-relay.exe` (the window) and `steam-audio-relay-cli.exe` (for the terminal). The icon comes from `make-icon.ps1`, in case you want other colors.
+You get `wavelink-remote-play.exe` (the window) and `wavelink-remote-play-cli.exe` (for the terminal). The icon comes from `make-icon.ps1`, in case you want other colors.
 
 ## Command line
 
 The window is all most people need. If you prefer a terminal:
 
 ```
-.\steam-audio-relay-cli.exe --list
-.\steam-audio-relay-cli.exe --target "{your-device-id}"
+.\wavelink-remote-play-cli.exe --list
+.\wavelink-remote-play-cli.exe
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `--list` | show playback devices and their ids |
-| `--target <id>` | device to play into. Not needed if exactly one device is called "System". |
-| `--source <id,id>` | devices to copy from. Default: all other devices of the target's driver. |
-| `--always` | don't wait for a stream, relay until closed |
-| `--raw` | don't undo the Wave Link faders (the opposite of "Full volume in the stream") |
-| `--verbose` | log the level every 5 seconds |
+| `--source <id,id>` | the devices to put into the stream. Default: Wave Link's channels. |
+| `--target <id>` | device to play into. Default: whatever device Steam records. |
+| `--keep-local` | same as "Keep the sound on at the PC" |
+| `--raw` | don't undo the Wave Link faders on copied channels |
+| `--always` | don't wait for a stream, copy until closed |
+| `--verbose` | log the level of the copied audio every 5 seconds |
 | `--selftest` | open the devices, run for 2 seconds, exit |
 | `--minimized` | window version only: start in the tray |
 
-Settings from the window are stored in `%APPDATA%\steam-audio-relay\settings.ini`.
+Settings from the window are stored in `%APPDATA%\wavelink-remote-play\settings.ini`.
 
 ## Tested on
 
-Only my own setup: Windows 11, Wave Link 3.5 (beta), an Elgato Wave XLR Pro and the Steam beta client. Clients were a Steam Deck, an iPhone with Steam Link and a MacBook. Other setups may behave differently, so tell me if yours does.
+Only my own setup: Windows 11, Wave Link 3.5 (beta), an Elgato Wave XLR Pro and the Steam beta client. The client was a Steam Deck with a surround system behind it, where a test tone came from the front and the back speakers as it should. Earlier versions also ran with an iPhone (Steam Link) and a MacBook. Other setups may behave differently, so tell me if yours does.
+
+Version 1 of this tool was called steam-audio-relay. It only copied audio into "System" in stereo, because I hadn't found the real cause yet.
+
+## Thanks
+
+The Windows interface for assigning a program to a playback device isn't documented. I took its layout from [EarTrumpet](https://github.com/File-New-Project/EarTrumpet).
 
 ## License
 

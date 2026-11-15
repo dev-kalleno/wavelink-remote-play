@@ -1,7 +1,8 @@
-// steam-audio-relay
+// wavelink-remote-play
 // Steam Remote Play records one playback device. Elgato Wave Link spreads your programs over several
-// (Game, Browser, Voice chat...), so most of them never reach the stream. This tool listens to those
-// other devices and mixes them into the one Steam records, while Steam is recording it. See README.md.
+// (System, Game, Browser, Voice chat...), so most of them never reach the stream. While Steam is recording,
+// this tool points the programs on those devices at the one Steam records, so they arrive there in whatever
+// layout the stream has, and copies over what is left. Afterwards everything goes back. See README.md.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -108,6 +109,29 @@ interface IAudioSessionControl2
     void GetProcessId(out uint pid);
 }
 
+// The interface behind Windows' "App volume and device preferences" page: which playback device a single
+// program uses. It isn't documented; the layout is the one EarTrumpet uses. Two ids, same methods: Windows
+// changed the id with 21H2.
+[Guid("ab3d4648-e242-459f-b02f-541c70306324"), InterfaceType(ComInterfaceType.InterfaceIsIInspectable)]
+interface IAudioPolicyConfig
+{
+    int s01(); int s02(); int s03(); int s04(); int s05(); int s06(); int s07(); int s08(); int s09(); int s10();
+    int s11(); int s12(); int s13(); int s14(); int s15(); int s16(); int s17(); int s18(); int s19();
+    [PreserveSig] int SetPersistedDefaultAudioEndpoint(uint pid, int flow, int role, IntPtr deviceId);
+    [PreserveSig] int GetPersistedDefaultAudioEndpoint(uint pid, int flow, int role, [Out, MarshalAs(UnmanagedType.HString)] out string deviceId);
+    [PreserveSig] int ClearAllPersistedApplicationDefaultEndpoints();
+}
+
+[Guid("2a59116d-6c4f-45e0-a74f-707e3fef9258"), InterfaceType(ComInterfaceType.InterfaceIsIInspectable)]
+interface IAudioPolicyConfigOld
+{
+    int s01(); int s02(); int s03(); int s04(); int s05(); int s06(); int s07(); int s08(); int s09(); int s10();
+    int s11(); int s12(); int s13(); int s14(); int s15(); int s16(); int s17(); int s18(); int s19();
+    [PreserveSig] int SetPersistedDefaultAudioEndpoint(uint pid, int flow, int role, IntPtr deviceId);
+    [PreserveSig] int GetPersistedDefaultAudioEndpoint(uint pid, int flow, int role, [Out, MarshalAs(UnmanagedType.HString)] out string deviceId);
+    [PreserveSig] int ClearAllPersistedApplicationDefaultEndpoints();
+}
+
 [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
 class MMDeviceEnumeratorCom { }
 
@@ -136,19 +160,16 @@ static class Relay
     static bool lastActive;
     static bool verbose;
     static volatile bool stop;          // asks the worker thread to finish
-    static volatile float Level;        // peak of the last second, 0..1 (for the window)
+    static volatile float Level;        // peak of the last 100 ms, 0..1 (for --verbose)
     static volatile string Status = ""; // one line for the window
     static volatile bool Relaying;      // a session is copying audio right now
 
     // Undo each source device's own volume fader, so the stream gets full level whatever the fader says.
     // (Wave Link's channel faders are exactly these Windows device volumes.)
     static volatile bool FullVolume = true;
-    // Per-source gain set in the window (device guid -> linear gain, 0 = muted). Replaced as a whole, never edited.
-    static volatile Dictionary<string, float> Gains = new Dictionary<string, float>();
-    // Per-source peak of the last 100 ms, for the meters in the window. Lock before use.
-    static readonly Dictionary<string, float> Meters = new Dictionary<string, float>();
-
     static volatile bool OpenBigPicture;    // open Steam Big Picture on the PC when a stream starts
+    static volatile bool Surround = true;   // while streaming, programs play straight into Steam's device
+    static volatile string Warning = "";    // one line for the window, when the setup keeps the stream stereo
 
     [DllImport("kernel32.dll")]
     static extern bool AttachConsole(int processId);
@@ -157,7 +178,7 @@ static class Relay
     {
         string line = DateTime.Now.ToString("HH:mm:ss") + "  " + msg;
         Console.WriteLine(line);
-        try { File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "steam-audio-relay.log"), line + Environment.NewLine); } catch { }
+        try { File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "wavelink-remote-play.log"), line + Environment.NewLine); } catch { }
     }
 
     // ---- device lookup (read from the registry, no COM enumeration needed) ----
@@ -328,24 +349,24 @@ static class Relay
         return isSteam;
     }
 
-    // true/false: steam.exe has / doesn't have an active audio session on the target. null: couldn't tell.
-    static bool? SteamRecording(Endpoint target)
+    // The processes that have an active audio session on a playback device. null: couldn't tell.
+    static List<uint> ActiveSessionPids(Endpoint dev)
     {
         IMMDeviceEnumerator en = null;
-        IMMDevice dev = null;
+        IMMDevice d = null;
         object mgr = null;
         IAudioSessionEnumerator list = null;
         try
         {
             en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
-            en.GetDevice(target.FullId, out dev);
+            en.GetDevice(dev.FullId, out d);
             Guid iid = IidSessionManager2;
-            dev.Activate(ref iid, 23, IntPtr.Zero, out mgr);
+            d.Activate(ref iid, 23, IntPtr.Zero, out mgr);
             ((IAudioSessionManager2)mgr).GetSessionEnumerator(out list);
             int n;
             list.GetCount(out n);
-            bool found = false;
-            for (int i = 0; i < n && !found; i++)
+            var pids = new List<uint>();
+            for (int i = 0; i < n; i++)
             {
                 IAudioSessionControl2 c;
                 list.GetSession(i, out c);
@@ -357,21 +378,30 @@ static class Relay
                     {
                         uint pid;
                         c.GetProcessId(out pid);
-                        found = IsSteam(pid);
+                        pids.Add(pid);
                     }
                 }
                 finally { Marshal.ReleaseComObject(c); }
             }
-            return found;
+            return pids;
         }
         catch { return null; }
         finally
         {
             if (list != null) Marshal.ReleaseComObject(list);
             if (mgr != null) Marshal.ReleaseComObject(mgr);
-            if (dev != null) Marshal.ReleaseComObject(dev);
+            if (d != null) Marshal.ReleaseComObject(d);
             if (en != null) Marshal.ReleaseComObject(en);
         }
+    }
+
+    // true/false: steam.exe has / doesn't have an active audio session on the device. null: couldn't tell.
+    static bool? SteamRecording(Endpoint dev)
+    {
+        var pids = ActiveSessionPids(dev);
+        if (pids == null) return null;
+        foreach (uint pid in pids) if (IsSteam(pid)) return true;
+        return false;
     }
 
     static bool detectBySession; // which signal answered last (for the grace period and the log)
@@ -381,6 +411,54 @@ static class Relay
         bool? rec = SteamRecording(target);
         detectBySession = rec.HasValue;
         return rec.HasValue ? rec.Value : StreamActive(logPath);
+    }
+
+    static bool IsSteamDevice(Endpoint e)
+    {
+        return e.Device.IndexOf("Steam Streaming Speakers", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    // Wave Link's playback devices: every device of the driver that has one called "System". Empty when
+    // there is no such driver (no Wave Link), or when "System" isn't unique and we'd have to guess.
+    static List<Endpoint> ChannelDevices(List<Endpoint> all)
+    {
+        var systems = all.FindAll(e => e.Name == "System");
+        if (systems.Count != 1) return new List<Endpoint>();
+        return all.FindAll(e => e.Device == systems[0].Device);
+    }
+
+    // Where to play when nothing tells us: Steam's own device if there is one, else the one called "System".
+    static Endpoint GuessTarget(List<Endpoint> all)
+    {
+        var steam = all.FindAll(IsSteamDevice);
+        if (steam.Count == 1) return steam[0];
+        var systems = all.FindAll(e => e.Name == "System");
+        return systems.Count == 1 ? systems[0] : null;
+    }
+
+    // The automatic target: the playback device steam.exe is recording right now, or null.
+    // Normally that is "Steam Streaming Speakers". It is a Wave Link channel instead when Steam itself is
+    // assigned to that channel in Wave Link - Windows then tells Steam that this is the default device.
+    static Endpoint FindRecorded(string logPath)
+    {
+        var all = ActiveRenderEndpoints();
+        Endpoint found = null;
+        bool readable = false;
+        foreach (var e in all)
+        {
+            bool? rec = SteamRecording(e);
+            if (!rec.HasValue) continue;
+            readable = true;
+            if (rec.Value && (found == null || IsSteamDevice(e))) found = e;
+        }
+        detectBySession = readable;
+        if (readable) return found;
+        return StreamActive(logPath) ? GuessTarget(all) : null;
+    }
+
+    static string Layout(int channels)
+    {
+        return channels == 2 ? "stereo" : channels == 6 ? "5.1" : channels == 8 ? "7.1" : channels + " ch";
     }
 
     // ---- audio ----
@@ -401,17 +479,6 @@ static class Relay
     [DllImport("winmm.dll")]
     static extern uint timeEndPeriod(uint ms);
 
-    // The "auto" sources: every other playback device of the driver the target belongs to. With Wave Link
-    // those are the channel devices (Game, Browser, Voice chat...), i.e. everything that never reaches
-    // "System" by itself. Taking them directly instead of a Wave Link mix means nothing can loop back.
-    static List<Endpoint> SiblingSources(Endpoint target)
-    {
-        var list = new List<Endpoint>();
-        foreach (var e in ActiveRenderEndpoints())
-            if (e.Device == target.Device && e.Name != target.Name) list.Add(e);
-        return list;
-    }
-
     class Src
     {
         public Endpoint E;
@@ -422,8 +489,7 @@ static class Relay
         public int Read, Count; // in frames
         public bool Primed;     // has enough queued to be mixed without gaps
         public IAudioEndpointVolume Vol; // the device's volume fader, may be null
-        public string Key;      // normalized guid, for Gains and Meters
-        public float Gain = 1f, GainTarget = 1f, Peak;
+        public float Gain = 1f, GainTarget = 1f;
     }
 
     // Converts interleaved frames from sch channels to tch channels.
@@ -518,7 +584,7 @@ static class Relay
                     c.Start();
                     IAudioEndpointVolume vol = null;
                     try { vol = OpenVolume(en, e.FullId); } catch { }
-                    srcs.Add(new Src { E = e, Client = c, Capture = (IAudioCaptureClient)co, Channels = sch, Ring = new float[cap * tch], Vol = vol, Key = NormGuid(e.Guid) });
+                    srcs.Add(new Src { E = e, Client = c, Capture = (IAudioCaptureClient)co, Channels = sch, Ring = new float[cap * tch], Vol = vol });
                     names.Add(e.Name + (sch != tch ? " (" + sch + " ch)" : ""));
                 }
                 catch (Exception ex)
@@ -530,21 +596,16 @@ static class Relay
             }
             if (srcs.Count == 0) throw new Exception("None of the source devices could be opened.");
 
-            // Gain per source: the slider from the window, times whatever undoes the device's own fader.
+            // Gain per source: whatever undoes the device's own volume fader, so the stream gets full level.
             // Loopback audio comes after that fader, so at -9 dB we multiply by +9 dB (capped at +30 dB).
             Action updateGains = delegate
             {
-                var gains = Gains;
                 foreach (var s in srcs)
                 {
-                    float ug;
-                    if (!gains.TryGetValue(s.Key, out ug)) ug = 1f;
                     float comp = 1f;
                     if (FullVolume && s.Vol != null)
                         try { float db; s.Vol.GetMasterVolumeLevel(out db); comp = (float)Math.Min(31.6, Math.Pow(10, -db / 20.0)); } catch { }
-                    s.GainTarget = ug * comp;
-                    lock (Meters) Meters[s.Key] = s.Peak;
-                    s.Peak = 0;
+                    s.GainTarget = comp;
                 }
             };
             updateGains();
@@ -553,7 +614,8 @@ static class Relay
             ren.Start();
             Relaying = true;
             Log("Relaying " + string.Join(", ", names.ToArray()) + " -> " + target.Name + " (" + tch + " ch, " + rate + " Hz)");
-            Status = "Relaying " + srcs.Count + (srcs.Count == 1 ? " device" : " devices");
+            Status = "Relaying " + srcs.Count + (srcs.Count == 1 ? " channel" : " channels") + " into "
+                + (IsSteamDevice(target) ? "Steam's device" : target.Name) + " (" + Layout(tch) + ")";
 
             int prime = rate / 50;            // 20 ms queued before a source joins the mix
             int want = rate * 30 / 1000;      // keep 30 ms in the target's buffer
@@ -603,20 +665,13 @@ static class Relay
                                 Marshal.Copy(data, tmp, 0, n * s.Channels);
                                 ToLayout(tmp, s.Channels, conv, tch, n);
                                 // apply the gain, gliding to a new value over this packet so changes don't click
-                                float g0 = s.Gain, g1 = s.GainTarget, pk = s.Peak;
+                                float g0 = s.Gain, g1 = s.GainTarget;
                                 for (int i = 0; i < n; i++)
                                 {
                                     float gn = g0 + (g1 - g0) * i / n;
-                                    for (int c = 0; c < tch; c++)
-                                    {
-                                        float v = conv[i * tch + c] * gn;
-                                        conv[i * tch + c] = v;
-                                        if (v < 0) v = -v;
-                                        if (v > pk) pk = v;
-                                    }
+                                    for (int c = 0; c < tch; c++) conv[i * tch + c] *= gn;
                                 }
                                 s.Gain = g1;
-                                s.Peak = pk;
                             }
                             s.Capture.ReleaseBuffer(frames);
                             Push(s, conv, n, tch, cap);
@@ -676,7 +731,6 @@ static class Relay
         finally
         {
             Relaying = false;
-            lock (Meters) Meters.Clear();
             timeEndPeriod(1);
             foreach (var s in srcs)
             {
@@ -692,32 +746,56 @@ static class Relay
 
     // ---- relay worker (used by the console mode and by the window) ----
 
+    // target == null means automatic: play into whatever device Steam records.
     static void Worker(Func<List<Endpoint>> getSources, Endpoint target, bool always)
     {
         string path = LogPath();
-        Log(always ? "Running continuously." : "Waiting for a Remote Play stream (until Steam records " + target.Name + ")");
+        Log(always ? "Running continuously." : "Waiting for a Remote Play stream (until Steam records " + (target != null ? target.Name : "a playback device") + ")");
         Status = always ? "Starting..." : "Waiting for a Remote Play stream";
         bool sessionStarted = false; // true from the first relay of a stream until it has really ended
         int hits = 0;
         var lastRelayEnd = DateTime.MinValue;
+        var lastChores = DateTime.MinValue;
+        var lastStreamSign = DateTime.UtcNow; // last time anything looked like a stream (or the worker started)
+        Endpoint cur = null;
         while (!stop)
         {
             // two positive checks in a row, half a second apart, so a blip can't start anything
             bool go = always;
-            if (!go)
+            if (always) cur = target ?? GuessTarget(ActiveRenderEndpoints());
+            else
             {
-                if (StreamActiveNow(target, path)) hits++; else hits = 0;
+                Endpoint seen = target != null ? (StreamActiveNow(target, path) ? target : null) : FindRecorded(path);
+                if (seen != null) { hits++; cur = seen; lastStreamSign = DateTime.UtcNow; } else hits = 0;
                 go = hits >= 2;
+            }
+            List<Endpoint> sources = null;
+            if (go)
+            {
+                Endpoint c = cur;
+                if (c != null) sources = getSources().FindAll(e => NormGuid(e.Guid) != NormGuid(c.Guid));
+                if (c == null || sources.Count == 0)
+                {
+                    Status = c == null ? "Found no device to play into." : "Nothing to relay into " + c.Name + ".";
+                    hits = 0;
+                    for (int i = 0; i < 20 && !stop; i++) Thread.Sleep(100);
+                    continue;
+                }
             }
             if (go)
             {
                 hits = 0;
-                Log(always ? "Starting relay." : "Stream active (" + (detectBySession ? "Steam is recording " + target.Name : "according to Steam's log") + "), starting relay.");
+                Endpoint tgt = cur;
+                Log(always ? "Starting relay." : "Stream active (" + (detectBySession ? "Steam is recording " + tgt.Name : "according to Steam's log") + "), starting relay.");
                 if (!sessionStarted)
                 {
                     sessionStarted = true;
                     if (OpenBigPicture) LaunchBigPicture();
                 }
+                bool mayMove = !always;
+                string why = always ? "" : StereoReason(tgt);
+                if (why != Warning) { Warning = why; if (why != "") Log(why); }
+                var lastMove = DateTime.MinValue;
                 var lastCheck = DateTime.UtcNow;
                 var lastSeenActive = DateTime.UtcNow;
                 bool active = true;
@@ -726,9 +804,14 @@ static class Relay
                 var lastGsCheck = DateTime.UtcNow;
                 try
                 {
-                    RunSession(getSources(), target, () =>
+                    RunSession(sources, tgt, () =>
                     {
                         if (stop) return false;
+                        if (mayMove && Surround && (DateTime.UtcNow - lastMove).TotalSeconds >= 0.5)
+                        {
+                            lastMove = DateTime.UtcNow;
+                            MoveApps(sources, tgt);
+                        }
                         if (OpenBigPicture && (DateTime.UtcNow - lastGsCheck).TotalSeconds >= 2)
                         {
                             lastGsCheck = DateTime.UtcNow;
@@ -744,7 +827,7 @@ static class Relay
                         if (!always && (DateTime.UtcNow - lastCheck).TotalSeconds >= 0.5)
                         {
                             lastCheck = DateTime.UtcNow;
-                            active = StreamActiveNow(target, path);
+                            active = StreamActiveNow(tgt, path);
                             if (active) lastSeenActive = DateTime.UtcNow;
                         }
                         // Steam's recording stays open through alt-tab and game starts, so 3 seconds without it
@@ -768,20 +851,297 @@ static class Relay
             }
             else
             {
-                // The relay itself follows Steam's recording to the second. The session as a whole (Big Picture)
-                // is only called over after 20 quiet seconds: launching a game from the library makes Steam end
-                // its stream and start a new one 5 to 10 seconds later, and that shouldn't close anything.
+                // The relay itself follows Steam's recording to the second. The session as a whole (Big Picture,
+                // games moved for surround) is only called over after 20 quiet seconds: launching a game from the
+                // library makes Steam end its stream and start a new one 5 to 10 seconds later, and that
+                // shouldn't undo anything.
                 if (sessionStarted && (DateTime.UtcNow - lastRelayEnd).TotalSeconds >= 20)
                 {
                     sessionStarted = false;
                     Log("Remote Play session over.");
+                    RestoreApps();
                     if (OpenBigPicture) CloseBigPicture();
                 }
+                if ((DateTime.UtcNow - lastChores).TotalSeconds >= 3)
+                {
+                    lastChores = DateTime.UtcNow;
+                    string why = StereoReason(null);
+                    // Steam puts the default device back when a stream ends. If it crashed mid-stream it didn't.
+                    if (why == "" && !sessionStarted && (DateTime.UtcNow - lastStreamSign).TotalSeconds >= 10 && DefaultIsSteamDevice())
+                        why = "Windows' default output is still Steam's device. Set it back to hear things at the PC.";
+                    Warning = why;
+                }
+                // Leftovers from an earlier run: only once it's clear that no stream is running, or a game would
+                // be pulled off Steam's device and pushed back a second later.
+                if (!sessionStarted && (DateTime.UtcNow - lastStreamSign).TotalSeconds >= 5) RestoreLeftovers();
                 for (int i = 0; i < 5 && !stop; i++) Thread.Sleep(100);
             }
         }
+        if (!restarting) RestoreApps();
         Status = "Stopped";
         Level = 0;
+    }
+
+    // ---- straight into the stream ----
+    //
+    // A Wave Link channel is a stereo device, so a game on such a channel can only ever be stereo, and Steam
+    // doesn't record it anyway. Steam's own device has as many channels as the client asked for. While a
+    // stream runs, the programs assigned to the chosen devices are pointed at the device Steam records (the
+    // same per-program setting Wave Link uses), and pointed back when the stream is over. Wave Link's own
+    // channel list is not touched. What can't be moved this way - programs that picked their device
+    // themselves, hardware inputs - is still copied over by the relay, in stereo.
+
+    [DllImport("combase.dll", PreserveSig = false)]
+    static extern void RoGetActivationFactory([MarshalAs(UnmanagedType.HString)] string id, [In] ref Guid iid, [Out, MarshalAs(UnmanagedType.IInspectable)] out object factory);
+    [DllImport("combase.dll", PreserveSig = false)]
+    static extern void WindowsCreateString([MarshalAs(UnmanagedType.LPWStr)] string s, int length, out IntPtr h);
+    [DllImport("combase.dll")]
+    static extern int WindowsDeleteString(IntPtr h);
+
+    const string RouteClass = "Windows.Media.Internal.AudioPolicyConfig";
+    const string RoutePrefix = @"\\?\SWD#MMDEVAPI#", RouteSuffix = "#{e6327cad-dcec-4949-ae8a-991e976a79d2}";
+
+    static bool RouteCall(Func<IAudioPolicyConfig, int> now, Func<IAudioPolicyConfigOld, int> old)
+    {
+        object f = null;
+        try
+        {
+            try
+            {
+                Guid iid = typeof(IAudioPolicyConfig).GUID;
+                RoGetActivationFactory(RouteClass, ref iid, out f);
+                return now((IAudioPolicyConfig)f) == 0;
+            }
+            catch
+            {
+                if (f != null) { try { Marshal.ReleaseComObject(f); } catch { } f = null; }
+                Guid iid = typeof(IAudioPolicyConfigOld).GUID;
+                RoGetActivationFactory(RouteClass, ref iid, out f);
+                return old((IAudioPolicyConfigOld)f) == 0;
+            }
+        }
+        catch { return false; }
+        finally { if (f != null) try { Marshal.ReleaseComObject(f); } catch { } }
+    }
+
+    // The device a program is assigned to, in Windows' long form. "" = none (it follows the default device),
+    // null = couldn't ask.
+    static string GetAppDevice(uint pid)
+    {
+        string s = null;
+        bool ok = RouteCall(f => f.GetPersistedDefaultAudioEndpoint(pid, 0, 0, out s), f => f.GetPersistedDefaultAudioEndpoint(pid, 0, 0, out s));
+        return ok ? (s ?? "") : null;
+    }
+
+    // Assigns a program to a device (long form as above), or with "" back to the default device.
+    static bool SetAppDevice(uint pid, string device)
+    {
+        IntPtr h = IntPtr.Zero;
+        try
+        {
+            if (!string.IsNullOrEmpty(device)) WindowsCreateString(device, device.Length, out h);
+            bool ok = true;
+            for (int role = 0; role < 2; role++) // console and multimedia, like Windows' own settings page
+            {
+                int r = role;
+                ok &= RouteCall(f => f.SetPersistedDefaultAudioEndpoint(pid, 0, r, h), f => f.SetPersistedDefaultAudioEndpoint(pid, 0, r, h));
+            }
+            return ok;
+        }
+        catch { return false; }
+        finally { if (h != IntPtr.Zero) WindowsDeleteString(h); }
+    }
+
+    // The name of the device steam.exe itself is assigned to, or null. Wave Link does this when Steam sits in
+    // one of its channels. Steam then records that channel instead of its own device, in stereo.
+    static string SteamPinned()
+    {
+        try
+        {
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName("steam"))
+            {
+                string id;
+                using (p) id = GetAppDevice((uint)p.Id);
+                if (string.IsNullOrEmpty(id)) continue;
+                foreach (var e in ActiveRenderEndpoints())
+                    if (id.IndexOf(e.Guid, StringComparison.OrdinalIgnoreCase) >= 0) return e.Name;
+                return "a playback device";
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // One line for the window when the stream is stereo although it wouldn't have to be. "" otherwise.
+    // recorded: the device Steam is recording right now, or null when no stream runs.
+    static string StereoReason(Endpoint recorded)
+    {
+        string pin = SteamPinned();
+        if (pin != null) return "Steam sits in Wave Link's \"" + pin + "\" channel: stereo only. Remove it from that channel.";
+        // Steam records a Wave Link channel without being assigned to it: Wave Link's lock put the default
+        // device back before Steam started recording.
+        if (recorded != null && ChannelDevices(ActiveRenderEndpoints()).Exists(e => NormGuid(e.Guid) == NormGuid(recorded.Guid)))
+            return "Steam records \"" + recorded.Name + "\": stereo only. Switch off the device lock in Wave Link's settings.";
+        return "";
+    }
+
+    static bool DefaultIsSteamDevice()
+    {
+        IMMDeviceEnumerator en = null;
+        IMMDevice d = null;
+        try
+        {
+            en = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+            en.GetDefaultAudioEndpoint(0, 1, out d); // playback, multimedia
+            string id;
+            d.GetId(out id);
+            foreach (var e in ActiveRenderEndpoints())
+                if (IsSteamDevice(e) && id.IndexOf(e.Guid, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
+        }
+        catch { return false; }
+        finally
+        {
+            if (d != null) Marshal.ReleaseComObject(d);
+            if (en != null) Marshal.ReleaseComObject(en);
+        }
+    }
+
+    class MovedApp { public string Name, Orig, From; }
+    // Everything below is guarded by lock (movedApps).
+    static readonly Dictionary<uint, MovedApp> movedApps = new Dictionary<uint, MovedApp>();
+    // process name -> the device to put it back on. Also kept in the settings file, so a program that was
+    // moved gets put back even if this tool was closed in between.
+    static readonly Dictionary<string, string> leftovers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    static readonly Dictionary<uint, int> moveTries = new Dictionary<uint, int>();
+    static int moving;
+    static volatile bool restarting; // the worker is only being restarted, leave moved programs where they are
+
+    static void LoadLeftovers()
+    {
+        var s = LoadSettings();
+        lock (movedApps)
+            foreach (var kv in s)
+                if (kv.Key.StartsWith("moved_")) leftovers[kv.Key.Substring(6)] = kv.Value;
+    }
+
+    static void Forget(string name)
+    {
+        lock (movedApps) leftovers.Remove(name);
+        UpdateSettings(d => { d.Remove("moved_" + name); });
+    }
+
+    // Points the programs that are assigned to one of the "from" devices at the target. Runs on a pool
+    // thread, the caller is the audio loop.
+    static void MoveApps(List<Endpoint> from, Endpoint target)
+    {
+        if (Interlocked.Exchange(ref moving, 1) == 1) return;
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            try
+            {
+                string to = RoutePrefix + target.FullId + RouteSuffix;
+                uint me = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+                foreach (var dev in from)
+                {
+                    // If Steam records a Wave Link channel, everything is stereo anyway and the relay does the
+                    // job. Moving programs from one channel to another would only mess up the mix at the PC.
+                    if (dev.Device == target.Device) continue;
+                    var pids = ActiveSessionPids(dev);
+                    if (pids == null) continue;
+                    foreach (uint pid in pids)
+                    {
+                        if (pid == 0 || pid == me) continue;
+                        // A program we already moved shows up here again when something put it back, which Wave
+                        // Link does now and then. Point it at the stream again, without counting tries.
+                        bool again;
+                        lock (movedApps)
+                        {
+                            again = movedApps.ContainsKey(pid);
+                            if (!again)
+                            {
+                                int tries;
+                                moveTries.TryGetValue(pid, out tries);
+                                if (tries >= 5) continue;
+                                if (moveTries.Count > 256) moveTries.Clear();
+                                moveTries[pid] = tries + 1;
+                            }
+                        }
+                        // Only programs that are assigned to this device, which is what sitting in a Wave Link
+                        // channel means. Not something that merely listens to it, like a recorder.
+                        string orig = GetAppDevice(pid);
+                        if (orig == null || orig.IndexOf(dev.Guid, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        string name;
+                        try { using (var p = System.Diagnostics.Process.GetProcessById((int)pid)) name = p.ProcessName; } catch { continue; }
+                        if (!SetAppDevice(pid, to)) { Log("Couldn't point " + name + " at " + target.Name + "."); continue; }
+                        if (again) { Log(name + " was back on " + dev.Name + ", pointed it at the stream again."); continue; }
+                        lock (movedApps) { movedApps[pid] = new MovedApp { Name = name, Orig = orig, From = NormGuid(dev.Guid) }; leftovers[name] = orig; }
+                        UpdateSettings(d => { d["moved_" + name] = orig; });
+                        Log(name + " now plays straight into " + target + ".");
+                    }
+                }
+            }
+            catch { }
+            finally { Interlocked.Exchange(ref moving, 0); }
+        });
+    }
+
+    // Puts the moved programs back on their own device. A program that has exited meanwhile stays on the
+    // leftovers list and is put back by RestoreLeftovers when it runs again.
+    // With a device guid: only the programs that came from that device.
+    static void RestoreApps(string onlyFrom = null)
+    {
+        var list = new List<KeyValuePair<uint, MovedApp>>();
+        lock (movedApps)
+        {
+            foreach (var kv in movedApps)
+                if (onlyFrom == null || kv.Value.From == onlyFrom) list.Add(kv);
+            foreach (var kv in list) { movedApps.Remove(kv.Key); moveTries.Remove(kv.Key); }
+            if (onlyFrom == null) moveTries.Clear();
+        }
+        foreach (var kv in list)
+        {
+            try { using (System.Diagnostics.Process.GetProcessById((int)kv.Key)) { } } catch { continue; } // gone
+            if (!SetAppDevice(kv.Key, kv.Value.Orig)) continue;
+            Forget(kv.Value.Name);
+            Log(kv.Value.Name + " is back on its own device.");
+        }
+    }
+
+    // For the window: device guid -> the programs from that device that currently play straight into the stream.
+    static Dictionary<string, string> MovedNames()
+    {
+        var d = new Dictionary<string, string>();
+        lock (movedApps)
+            foreach (var m in movedApps.Values)
+            {
+                string cur;
+                d[m.From] = d.TryGetValue(m.From, out cur) ? cur + ", " + m.Name : m.Name;
+            }
+        return d;
+    }
+
+    static void RestoreLeftovers()
+    {
+        List<KeyValuePair<string, string>> list;
+        lock (movedApps)
+        {
+            if (leftovers.Count == 0) return;
+            list = new List<KeyValuePair<string, string>>(leftovers);
+        }
+        foreach (var kv in list)
+        {
+            bool done = false;
+            try
+            {
+                foreach (var p in System.Diagnostics.Process.GetProcessesByName(kv.Key))
+                    using (p) if (SetAppDevice((uint)p.Id, kv.Value)) done = true;
+            }
+            catch { }
+            if (!done) continue;
+            Forget(kv.Key);
+            Log(kv.Key + " is back on its own device.");
+        }
     }
 
     static void LaunchBigPicture() { SteamUrl("steam://open/bigpicture", "Opened Steam Big Picture."); }
@@ -801,11 +1161,12 @@ static class Relay
     // ---- settings and autostart (window mode) ----
 
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    const string RunValue = "steam-audio-relay";
+    const string RunValue = "wavelink-remote-play";
+    const string AppName = "Remote Play Audio for Wave Link";
 
     static string SettingsPath()
     {
-        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "steam-audio-relay", "settings.ini");
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "wavelink-remote-play", "settings.ini");
     }
 
     static Dictionary<string, string> LoadSettings()
@@ -844,6 +1205,18 @@ static class Relay
         }
     }
 
+    // Earlier versions were called steam-audio-relay. If that one was set to start with Windows, this one
+    // takes over its entry.
+    static void MigrateAutostart()
+    {
+        using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true))
+        {
+            if (k == null || k.GetValue("steam-audio-relay") == null) return;
+            k.DeleteValue("steam-audio-relay", false);
+            k.SetValue(RunValue, "\"" + Application.ExecutablePath + "\" --minimized");
+        }
+    }
+
     static bool AutostartEnabled()
     {
         using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
@@ -865,7 +1238,7 @@ static class Relay
     static readonly Color CBg = Color.FromArgb(27, 27, 27), CCard = Color.FromArgb(42, 42, 42), CCardHi = Color.FromArgb(56, 56, 56),
         CText = Color.FromArgb(242, 242, 242), CSub = Color.FromArgb(160, 160, 160), CAccent = Color.FromArgb(76, 194, 255),
         CTrack = Color.FromArgb(70, 70, 70), CGreen = Color.FromArgb(47, 209, 91), CRed = Color.FromArgb(255, 110, 110),
-        CRedBg = Color.FromArgb(74, 38, 38);
+        CRedBg = Color.FromArgb(74, 38, 38), CAmber = Color.FromArgb(255, 190, 70);
     static readonly Font FTitle = new Font("Segoe UI Semibold", 13f), FName = new Font("Segoe UI Semibold", 9.75f),
         FText = new Font("Segoe UI", 9f), FSmall = new Font("Segoe UI", 8.25f), FCaps = new Font("Segoe UI Semibold", 8f);
     const ControlStyles Painted = ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw;
@@ -889,15 +1262,6 @@ static class Relay
     {
         using (var p = Round(r, rad))
         using (var b = new SolidBrush(c)) g.FillPath(b, p);
-    }
-
-    class Item
-    {
-        public Endpoint E;
-        public override string ToString()
-        {
-            return E.Name + " (" + E.Device + ")  [" + E.Guid.Trim('{', '}').Substring(0, 8) + "]";
-        }
     }
 
     // The icon is built into the exe (see build.cmd); fall back to the stock one if that ever fails.
@@ -938,100 +1302,6 @@ static class Relay
         }
     }
 
-    // Volume slider with the level meter drawn inside the track.
-    class Fader : Control
-    {
-        int val = 100;
-        float level;
-        bool drag;
-        public bool Dim;
-        public event EventHandler Changed;
-        public int Value { get { return val; } set { val = Math.Max(0, Math.Min(100, value)); Invalidate(); } }
-        public float LevelValue { set { if (Math.Abs(level - value) > 0.003f) { level = value; Invalidate(); } } }
-        public Fader() { SetStyle(Painted, true); Size = new Size(236, 24); Cursor = Cursors.Hand; BackColor = CCard; }
-        void SetFromX(int x)
-        {
-            int v = (int)Math.Round((x - 10) * 100.0 / (Width - 20));
-            v = Math.Max(0, Math.Min(100, v));
-            if (v == val) return;
-            val = v;
-            Invalidate();
-            if (Changed != null) Changed(this, EventArgs.Empty);
-        }
-        protected override void OnMouseDown(MouseEventArgs e) { drag = true; SetFromX(e.X); }
-        protected override void OnMouseMove(MouseEventArgs e) { if (drag) SetFromX(e.X); }
-        protected override void OnMouseUp(MouseEventArgs e) { drag = false; }
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(BackColor);
-            var track = new RectangleF(2, Height / 2f - 5, Width - 4, 10);
-            FillRound(g, CTrack, track, 5);
-            // meter: -60 dB .. 0 dB across the track
-            float m = level <= 0.001f ? 0 : (float)Math.Max(0, Math.Min(1, (20 * Math.Log10(level) + 60) / 60));
-            if (m > 0.02f) FillRound(g, CGreen, new RectangleF(track.X, track.Y + 2, Math.Max(8, track.Width * m), 6), 3);
-            float kx = 10 + (Width - 20) * val / 100f;
-            using (var b = new SolidBrush(Dim ? CSub : CAccent)) g.FillEllipse(b, kx - 8, Height / 2f - 8, 16, 16);
-        }
-    }
-
-    // Plain level meter (for the output).
-    class Meter : Control
-    {
-        float level;
-        public float LevelValue { set { if (Math.Abs(level - value) > 0.003f) { level = value; Invalidate(); } } }
-        public Meter() { SetStyle(Painted, true); Size = new Size(200, 10); BackColor = CCard; }
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(BackColor);
-            var track = new RectangleF(0, 0, Width, Height);
-            FillRound(g, CTrack, track, Height / 2f);
-            float m = level <= 0.001f ? 0 : (float)Math.Max(0, Math.Min(1, (20 * Math.Log10(level) + 60) / 60));
-            if (m > 0.02f) FillRound(g, CGreen, new RectangleF(2, 2, Math.Max(8, (Width - 4) * m), Height - 4), (Height - 4) / 2f);
-        }
-    }
-
-    // Speaker icon that toggles mute.
-    class MuteButton : Control
-    {
-        bool muted;
-        public event EventHandler Changed;
-        public bool Muted { get { return muted; } set { if (muted != value) { muted = value; Invalidate(); } } }
-        public MuteButton() { SetStyle(Painted, true); Size = new Size(32, 32); Cursor = Cursors.Hand; BackColor = CCard; }
-        protected override void OnClick(EventArgs e)
-        {
-            muted = !muted;
-            Invalidate();
-            if (Changed != null) Changed(this, EventArgs.Empty);
-        }
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(BackColor);
-            Color c = muted ? CRed : CText;
-            if (muted) using (var p = Round(new RectangleF(1, 1, 30, 30), 6)) using (var pen = new Pen(CRed, 1.2f)) g.DrawPath(pen, p);
-            using (var pen = new Pen(c, 1.7f))
-            {
-                pen.LineJoin = LineJoin.Round; pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round;
-                g.DrawPolygon(pen, new[] { new PointF(8, 13), new PointF(11.5f, 13), new PointF(16, 9), new PointF(16, 23), new PointF(11.5f, 19), new PointF(8, 19) });
-                if (muted)
-                {
-                    g.DrawLine(pen, 20, 13, 25, 19);
-                    g.DrawLine(pen, 25, 13, 20, 19);
-                }
-                else
-                {
-                    g.DrawArc(pen, 14, 11.5f, 8, 9, -55, 110);
-                    g.DrawArc(pen, 12, 8, 13, 16, -55, 110);
-                }
-            }
-        }
-    }
-
     class PillButton : Control
     {
         public bool Primary = true;
@@ -1062,43 +1332,36 @@ static class Relay
         return pal[index % pal.Length];
     }
 
-    // One channel of the stream mix: badge, name, mute, volume with meter.
+    // One channel: badge, name, and the switch that puts it into the stream.
     class ChannelRow : Control
     {
         public Endpoint E;
         public string Key;
-        public MuteButton Mute = new MuteButton();
-        public Fader Fader = new Fader();
+        public Toggle T = new Toggle();
+        public bool FullName; // show "name (device)", for setups without Wave Link
         Color badge;
+        string note = "";
+        public string Note { set { if (note != value) { note = value; Invalidate(); } } }
         public ChannelRow(Endpoint e, Color badgeColor)
         {
             SetStyle(Painted, true);
             E = e; Key = NormGuid(e.Guid); badge = badgeColor;
             Size = new Size(580, 46);
-            Mute.Location = new Point(232, 7);
-            Fader.Location = new Point(274, 11);
-            Controls.Add(Mute);
-            Controls.Add(Fader);
-            Mute.Changed += delegate { Sync(); };
-            Fader.Changed += delegate { Invalidate(); };
-            Sync();
-        }
-        public void Sync()
-        {
-            Color c = Mute.Muted ? CRedBg : CCard;
-            Mute.BackColor = c; Fader.BackColor = c; Fader.Dim = Mute.Muted;
-            Mute.Invalidate(); Fader.Invalidate(); Invalidate();
+            T.Location = new Point(580 - 44 - 14, 11);
+            Controls.Add(T);
+            T.Changed += delegate { Invalidate(); };
         }
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(CBg);
-            FillRound(g, Mute.Muted ? CRedBg : CCard, new RectangleF(0, 0, Width, Height), 8);
-            FillRound(g, badge, new RectangleF(8, 8, 30, 30), 7);
+            FillRound(g, CCard, new RectangleF(0, 0, Width, Height), 8);
+            FillRound(g, T.On ? badge : CTrack, new RectangleF(8, 8, 30, 30), 7);
             TextRenderer.DrawText(g, E.Name.Substring(0, 1).ToUpperInvariant(), FName, new Rectangle(8, 8, 30, 30), Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-            TextRenderer.DrawText(g, E.Name, FName, new Rectangle(48, 0, 180, Height), Mute.Muted ? CSub : CText, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
-            TextRenderer.DrawText(g, Mute.Muted ? "muted" : Fader.Value + " %", FText, new Rectangle(514, 0, 56, Height), CSub, TextFormatFlags.VerticalCenter | TextFormatFlags.Right);
+            TextRenderer.DrawText(g, FullName ? E.ToString() : E.Name, FName, new Rectangle(48, 0, note.Length > 0 ? 250 : 460, Height), T.On ? CText : CSub, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+            if (note.Length > 0)
+                TextRenderer.DrawText(g, note, FSmall, new Rectangle(300, 0, 210, Height), CGreen, TextFormatFlags.VerticalCenter | TextFormatFlags.Right | TextFormatFlags.EndEllipsis);
         }
     }
 
@@ -1126,60 +1389,19 @@ static class Relay
         }
     }
 
-    // The card with the target device and the meter of what goes into it.
-    class OutputCard : Control
-    {
-        public ComboBox Target = new ComboBox();
-        public Meter Out = new Meter();
-        public OutputCard()
-        {
-            SetStyle(Painted, true);
-            Size = new Size(580, 66);
-            Target.SetBounds(14, 30, 340, 24);
-            Target.DropDownStyle = ComboBoxStyle.DropDownList;
-            Target.FlatStyle = FlatStyle.Flat;
-            Target.BackColor = CCardHi;
-            Target.ForeColor = CText;
-            Target.Font = FText;
-            Target.DrawMode = DrawMode.OwnerDrawFixed;
-            Target.ItemHeight = 18;
-            Target.DrawItem += delegate(object s, DrawItemEventArgs e)
-            {
-                if (e.Index < 0) return;
-                bool sel = (e.State & DrawItemState.Selected) != 0 && (e.State & DrawItemState.ComboBoxEdit) == 0;
-                using (var b = new SolidBrush(sel ? CAccent : CCardHi)) e.Graphics.FillRectangle(b, e.Bounds);
-                TextRenderer.DrawText(e.Graphics, Target.Items[e.Index].ToString(), FText, e.Bounds, sel ? Color.Black : CText, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
-            };
-            Out.SetBounds(372, 38, 194, 10);
-            Controls.Add(Target);
-            Controls.Add(Out);
-        }
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(CBg);
-            FillRound(g, CCard, new RectangleF(0, 0, Width, Height), 8);
-            TextRenderer.DrawText(g, "Plays into (the device Steam records)", FSmall, new Rectangle(14, 8, 340, 18), CSub, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
-            TextRenderer.DrawText(g, "Stream level", FSmall, new Rectangle(372, 8, 194, 18), CSub, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
-        }
-    }
-
     class MainForm : Form
     {
         Panel body = new Panel();
         PictureBox pic = new PictureBox();
-        Label lblTitle = new Label(), lblStatus = new Label(), lblMix = new Label(), lblMixSub = new Label(), lblOpt = new Label(), lblRefresh = new Label(), lblNone = new Label();
+        Label lblTitle = new Label(), lblStatus = new Label(), lblWarn = new Label(), lblMix = new Label(), lblMixSub = new Label(), lblOpt = new Label(), lblRefresh = new Label(), lblNone = new Label();
         PillButton btnToggle = new PillButton();
-        OutputCard output = new OutputCard();
         List<ChannelRow> rows = new List<ChannelRow>();
-        OptionRow optFull = new OptionRow("Full volume in the stream", "The stream gets 100 % even when a channel's fader in Wave Link is turned down."),
-            optStream = new OptionRow("Only while streaming", "Relay only while a Steam Remote Play stream is running."),
+        OptionRow optLocal = new OptionRow("Keep the sound on at the PC", "For when someone sits at the PC during the stream. The stream is stereo then, not surround."),
             optAuto = new OptionRow("Start with Windows", "Starts minimized to the tray."),
             optBig = new OptionRow("Big Picture", "Open Steam Big Picture when a stream starts, close it when it ends.");
         NotifyIcon tray = new NotifyIcon();
         System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
-        bool startHidden, loading, reallyExit, wantRun, preview;
+        bool startHidden, reallyExit, wantRun, preview;
         int ticks;
         Thread worker;
 
@@ -1193,7 +1415,7 @@ static class Relay
         {
             startHidden = hidden;
             preview = previewOnly;
-            Text = "Steam Audio Relay";
+            Text = AppName;
             Icon = AppIcon(null);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
@@ -1211,43 +1433,31 @@ static class Relay
             pic.SetBounds(20, 16, 36, 36);
             pic.SizeMode = PictureBoxSizeMode.Zoom;
             try { pic.Image = AppIcon(new Size(48, 48)).ToBitmap(); } catch { }
-            Caption(lblTitle, "Steam Audio Relay", FTitle, CText).Location = new Point(64, 12);
+            Caption(lblTitle, AppName, FTitle, CText).Location = new Point(64, 12);
             Caption(lblStatus, "", FText, CSub).Location = new Point(66, 38);
+            Caption(lblWarn, "", FSmall, CAmber).Location = new Point(22, 57);
             btnToggle.Location = new Point(504, 18);
             btnToggle.Click += delegate
             {
                 if (worker != null) { wantRun = false; StopWorker(); }
                 else { wantRun = true; StartWorker(); }
             };
-            Caption(lblMix, "STREAM VOLUME", FCaps, CSub).Location = new Point(22, 74);
-            Caption(lblMixSub, "How loud each channel is in the stream. This changes nothing in Wave Link.", FSmall, CSub).Location = new Point(22, 92);
+            Caption(lblMix, "IN THE STREAM", FCaps, CSub).Location = new Point(22, 74);
+            Caption(lblMixSub, "The channels the other side should hear. This changes nothing in Wave Link.", FSmall, CSub).Location = new Point(22, 92);
             Caption(lblRefresh, "Refresh", FSmall, CAccent).Location = new Point(552, 74);
             lblRefresh.Cursor = Cursors.Hand;
-            lblRefresh.Click += delegate { LoadDevices(); BuildRows(); if (wantRun) StartWorker(); };
-            Caption(lblNone, "No other playback devices found for this target.", FText, CSub);
+            lblRefresh.Click += delegate { BuildRows(); if (wantRun) StartWorker(); };
+            Caption(lblNone, "No playback devices found.", FText, CSub);
             lblNone.Visible = false;
             Caption(lblOpt, "OPTIONS", FCaps, CSub);
-            body.Controls.AddRange(new Control[] { pic, lblTitle, lblStatus, btnToggle, lblMix, lblMixSub, lblRefresh, lblNone, output, lblOpt, optFull, optStream, optAuto, optBig });
+            body.Controls.AddRange(new Control[] { pic, lblTitle, lblStatus, lblWarn, btnToggle, lblMix, lblMixSub, lblRefresh, lblNone, lblOpt, optLocal, optAuto, optBig });
 
-            output.Target.SelectedIndexChanged += delegate
+            optLocal.T.Changed += delegate
             {
-                if (loading) return;
-                string tgt = SelectedGuid() ?? "";
-                UpdateSettings(d => { d["target"] = tgt; });
-                BuildRows();
-                if (wantRun) StartWorker();
-            };
-            optFull.T.Changed += delegate
-            {
-                FullVolume = optFull.T.On;
-                bool v = optFull.T.On;
-                UpdateSettings(d => { d["fullvolume"] = v ? "1" : "0"; });
-            };
-            optStream.T.Changed += delegate
-            {
-                bool v = optStream.T.On;
-                UpdateSettings(d => { d["always"] = v ? "0" : "1"; });
-                if (wantRun) StartWorker();
+                bool v = optLocal.T.On;
+                Surround = !v;
+                UpdateSettings(d => { d["keeplocal"] = v ? "1" : "0"; });
+                if (v) ThreadPool.QueueUserWorkItem(delegate { RestoreApps(); });
             };
             optAuto.T.Changed += delegate
             {
@@ -1266,20 +1476,17 @@ static class Relay
             menu.Items.Add("Exit", null, delegate { reallyExit = true; Close(); });
             tray.ContextMenuStrip = menu;
             tray.Icon = AppIcon(SystemInformation.SmallIconSize);
-            tray.Text = "Steam Audio Relay";
+            tray.Text = AppName;
             tray.DoubleClick += delegate { ShowWindow(); };
             tray.Visible = !previewOnly;
 
-            loading = true;
             var s = LoadSettings();
-            optFull.T.On = !s.ContainsKey("fullvolume") || s["fullvolume"] == "1";
-            FullVolume = optFull.T.On;
-            optStream.T.On = !(s.ContainsKey("always") && s["always"] == "1");
+            optLocal.T.On = s.ContainsKey("keeplocal") && s["keeplocal"] == "1";
+            Surround = !optLocal.T.On;
             optBig.T.On = s.ContainsKey("bigpicture") && s["bigpicture"] == "1";
             OpenBigPicture = optBig.T.On;
+            if (!previewOnly) try { MigrateAutostart(); } catch { }
             try { optAuto.T.On = AutostartEnabled(); } catch { }
-            LoadDevices();
-            loading = false;
             BuildRows();
 
             timer.Interval = 60;
@@ -1288,19 +1495,18 @@ static class Relay
 
             if (previewOnly)
             {
-                // sample values so a screenshot shows what the window looks like in use
-                Status = "Relaying " + rows.Count + " devices";
+                // sample state so a screenshot shows what the window looks like in use
+                int n = 0;
+                foreach (var r in rows) if (r.T.On) n++;
+                Status = "Relaying " + n + " channels into Steam's device (7.1)";
                 Relaying = true;
-                var sample = new[] { 0.5f, 0.02f, 0f, 0.12f, 0f, 0.3f };
-                for (int i = 0; i < rows.Count; i++) rows[i].Fader.LevelValue = sample[i % sample.Length];
-                output.Out.LevelValue = 0.6f;
                 Tick();
                 return;
             }
 
+            LoadLeftovers();
             wantRun = true;
-            if (output.Target.SelectedItem != null) StartWorker();
-            else Status = "Pick the device Steam records.";
+            StartWorker();
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -1314,100 +1520,60 @@ static class Relay
             bool relaying = Relaying && (worker != null || preview);
             lblStatus.Text = Status;
             lblStatus.ForeColor = relaying ? CGreen : CSub;
+            string w = preview ? "" : Warning;
+            if (lblWarn.Text != w) lblWarn.Text = w;
             bool running = worker != null || preview;
             string t = running ? "Stop" : "Start";
             if (btnToggle.Text != t) { btnToggle.Primary = !running; btnToggle.Text = t; }
             if (preview) return;
-            foreach (var r in rows)
+            if (++ticks % 8 == 0)
             {
-                float v = 0;
-                if (relaying) lock (Meters) Meters.TryGetValue(r.Key, out v);
-                r.Fader.LevelValue = v;
+                // which programs currently play straight into the stream, per channel
+                var moved = MovedNames();
+                foreach (var r in rows)
+                {
+                    string names;
+                    r.Note = moved.TryGetValue(r.Key, out names) ? "direct: " + names : "";
+                }
             }
-            output.Out.LevelValue = relaying ? Level : 0;
-            if (++ticks % 16 == 0)
+            if (ticks % 16 == 0)
             {
-                string tt = "Steam Audio Relay: " + Status;
+                string tt = "Remote Play Audio: " + Status;
                 tray.Text = tt.Length > 63 ? tt.Substring(0, 63) : tt;
             }
         }
 
-        string SelectedGuid()
-        {
-            var it = output.Target.SelectedItem as Item;
-            return it == null ? null : it.E.Guid;
-        }
-
-        void LoadDevices()
-        {
-            bool was = loading;
-            loading = true;
-            var s = LoadSettings();
-            string old = SelectedGuid() ?? (s.ContainsKey("target") ? s["target"] : "");
-            var all = ActiveRenderEndpoints();
-            all.Sort((a, b) => string.Compare(a.Name + a.Device, b.Name + b.Device, StringComparison.OrdinalIgnoreCase));
-            output.Target.Items.Clear();
-            foreach (var e in all) output.Target.Items.Add(new Item { E = e });
-            if (!string.IsNullOrEmpty(old))
-                foreach (Item it in output.Target.Items)
-                    if (NormGuid(it.E.Guid) == NormGuid(old)) { output.Target.SelectedItem = it; break; }
-            if (output.Target.SelectedItem == null)
-            {
-                var systems = new List<Item>();
-                foreach (Item it in output.Target.Items) if (it.E.Name == "System") systems.Add(it);
-                if (systems.Count == 1) output.Target.SelectedItem = systems[0];
-            }
-            loading = was;
-        }
-
-        // The channel rows: the other devices of the target's driver. Without such siblings (no Wave Link) every
-        // other playback device is offered, muted until the user turns it on.
+        // The rows: Wave Link's devices, all switched on. Without Wave Link every playback device is offered,
+        // switched off until the user picks. Steam's own devices are never rows.
         void BuildRows()
         {
             foreach (var r in rows) { body.Controls.Remove(r); r.Dispose(); }
             rows.Clear();
-            var t = output.Target.SelectedItem as Item;
-            if (t != null)
+            var s = preview ? new Dictionary<string, string>() : LoadSettings(); // screenshots show the defaults
+            var all = ActiveRenderEndpoints();
+            var list = ChannelDevices(all);
+            bool channels = list.Count > 0;
+            if (!channels) list = all;
+            list = list.FindAll(e => !e.Device.StartsWith("Steam Streaming", StringComparison.OrdinalIgnoreCase));
+            list.Sort((a, b) => string.Compare(a.Name + a.Device, b.Name + b.Device, StringComparison.OrdinalIgnoreCase));
+            int i = 0;
+            foreach (var e in list)
             {
-                var s = preview ? new Dictionary<string, string>() : LoadSettings(); // screenshots show the defaults
-                var list = SiblingSources(t.E);
-                bool siblings = list.Count > 0;
-                if (!siblings)
-                    foreach (var e in ActiveRenderEndpoints())
-                        if (NormGuid(e.Guid) != NormGuid(t.E.Guid)) list.Add(e);
-                list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
-                int i = 0;
-                foreach (var e in list)
+                var row = new ChannelRow(e, BadgeColor(e.Name, i++));
+                string k = row.Key;
+                row.FullName = !channels;
+                row.T.On = s.ContainsKey("on_" + k) ? s["on_" + k] == "1" : channels;
+                row.T.Changed += delegate
                 {
-                    var row = new ChannelRow(e, BadgeColor(e.Name, i++));
-                    string k = row.Key;
-                    int lvl;
-                    if (s.ContainsKey("lvl_" + k) && int.TryParse(s["lvl_" + k], out lvl)) row.Fader.Value = lvl;
-                    row.Mute.Muted = s.ContainsKey("mute_" + k) ? s["mute_" + k] == "1" : !siblings;
-                    row.Sync();
-                    row.Fader.Changed += delegate { SaveRow(row); };
-                    row.Mute.Changed += delegate { SaveRow(row); };
-                    rows.Add(row);
-                    body.Controls.Add(row);
-                }
+                    bool on = row.T.On;
+                    UpdateSettings(d => { d["on_" + k] = on ? "1" : "0"; });
+                    if (!on) ThreadPool.QueueUserWorkItem(delegate { RestoreApps(k); });
+                    if (wantRun) StartWorker();
+                };
+                rows.Add(row);
+                body.Controls.Add(row);
             }
-            PublishGains();
             Relayout();
-        }
-
-        void SaveRow(ChannelRow row)
-        {
-            string k = row.Key, lvl = row.Fader.Value.ToString(), m = row.Mute.Muted ? "1" : "0";
-            UpdateSettings(d => { d["lvl_" + k] = lvl; d["mute_" + k] = m; });
-            PublishGains();
-        }
-
-        // Hands the slider positions to the audio thread. The curve is quadratic, so 50 % is about -12 dB.
-        void PublishGains()
-        {
-            var g = new Dictionary<string, float>();
-            foreach (var r in rows) g[r.Key] = r.Mute.Muted ? 0f : (r.Fader.Value / 100f) * (r.Fader.Value / 100f);
-            Gains = g;
         }
 
         void Relayout()
@@ -1417,9 +1583,9 @@ static class Relay
             foreach (var r in rows) { r.Location = new Point(20, y); y += 50; }
             lblNone.Visible = rows.Count == 0;
             if (rows.Count == 0) { lblNone.Location = new Point(22, y + 4); y += 34; }
-            output.Location = new Point(20, y + 4); y += 4 + 66 + 18;
+            y += 14;
             lblOpt.Location = new Point(22, y); y += 22;
-            foreach (var o in new[] { optFull, optStream, optAuto, optBig }) { o.Location = new Point(20, y); y += 54; }
+            foreach (var o in new[] { optLocal, optAuto, optBig }) { o.Location = new Point(20, y); y += 54; }
             y += 12;
             int max = Screen.FromControl(this).WorkingArea.Height - 80;
             bool scroll = y > max;
@@ -1429,17 +1595,14 @@ static class Relay
 
         void StartWorker()
         {
+            restarting = true; // programs that were moved stay where they are across the restart
             StopWorker();
-            var t = output.Target.SelectedItem as Item;
-            if (t == null) { Status = "Pick the device Steam records."; return; }
-            if (rows.Count == 0) { Status = "Nothing to relay: no other playback devices."; return; }
+            restarting = false;
             var list = new List<Endpoint>();
-            foreach (var r in rows) list.Add(r.E);
-            PublishGains();
+            foreach (var r in rows) if (r.T.On) list.Add(r.E);
+            if (list.Count == 0) { Status = "No channel is switched on."; return; }
             stop = false;
-            Endpoint te = t.E;
-            bool always = !optStream.T.On;
-            worker = new Thread(delegate() { Worker(delegate { return list; }, te, always); });
+            worker = new Thread(delegate() { Worker(delegate { return list; }, null, false); });
             worker.IsBackground = true;
             worker.Start();
         }
@@ -1511,11 +1674,11 @@ static class Relay
         }
 
         bool created;
-        using (var mutex = new Mutex(true, "steam-audio-relay", out created))
+        using (var mutex = new Mutex(true, "wavelink-remote-play", out created))
         {
             if (!created)
             {
-                MessageBox.Show("Steam Audio Relay is already running (look in the tray).", "Steam Audio Relay");
+                MessageBox.Show(AppName + " is already running (look in the tray).", AppName);
                 return 1;
             }
             Application.Run(new MainForm(Array.IndexOf(args, "--minimized") >= 0, false));
@@ -1534,14 +1697,16 @@ static class Relay
     static void PrintUsage()
     {
         Console.WriteLine("Run without arguments to open the window. Command line:");
-        Console.WriteLine("Usage: steam-audio-relay-cli.exe [--target <id>] [--source <id>] [--always] [--selftest] [--list] [--verbose]");
+        Console.WriteLine("Usage: wavelink-remote-play-cli.exe [--target <id>] [--source <id,id>] [--always] [--selftest] [--list] [--verbose]");
         Console.WriteLine("  --list      show playback devices and their ids");
-        Console.WriteLine("  --target    device to play into (id from --list). Optional if only one device is named \"System\".");
-        Console.WriteLine("  --source    device(s) to copy from, comma separated. Default: all other playback devices of the target's driver.");
+        Console.WriteLine("  --target    device to play into (id from --list). Default: whatever device Steam records.");
+        Console.WriteLine("  --source    device(s) to copy from, comma separated. Default: Wave Link's devices.");
         Console.WriteLine("  --always    don't wait for a Steam stream, relay until closed");
         Console.WriteLine("  --selftest  open both devices, run for 2 seconds, exit");
         Console.WriteLine("  --verbose   log the audio level every 5 seconds (to check that signal arrives)");
         Console.WriteLine("  --raw       don't undo the source devices' volume faders (by default the stream gets full level)");
+        Console.WriteLine("  --keep-local  keep the sound on at the PC: only copy it into the stream, in stereo. By default the programs");
+        Console.WriteLine("              on the source devices play straight into Steam's device while streaming (surround, silent at the PC).");
         Console.WriteLine("  --minimized (window mode) start in the tray");
     }
 
@@ -1549,7 +1714,7 @@ static class Relay
     static int Main(string[] args)
     {
         bool cli = false;
-        foreach (string f in new[] { "--list", "--help", "-h", "--selftest", "--target", "--source", "--always", "--verbose", "--raw" })
+        foreach (string f in new[] { "--list", "--help", "-h", "--selftest", "--target", "--source", "--always", "--verbose", "--raw", "--keep-local" })
             if (Array.IndexOf(args, f) >= 0) cli = true;
         if (!cli) return RunUi(args);
 
@@ -1562,36 +1727,25 @@ static class Relay
 
         verbose = Array.IndexOf(args, "--verbose") >= 0;
         FullVolume = Array.IndexOf(args, "--raw") < 0;
+        Surround = Array.IndexOf(args, "--keep-local") < 0;
         bool always = Array.IndexOf(args, "--always") >= 0;
         bool selftest = Array.IndexOf(args, "--selftest") >= 0;
 
-        // target: explicit id, or the one device called "System"
+        // target: an explicit id, or automatic (whatever Steam records)
         Endpoint target = null;
         string tgtArg = Arg(args, "--target");
-        if (tgtArg != null)
+        if (tgtArg != null && tgtArg != "auto")
         {
             target = ByGuid(all, tgtArg);
             if (target == null) { Log("No active playback device with id " + tgtArg + ". Try --list."); return 3; }
         }
-        else
-        {
-            var cands = all.FindAll(e => e.Name == "System");
-            if (cands.Count == 1) target = cands[0];
-            else
-            {
-                Log(cands.Count == 0 ? "No playback device named \"System\" found." : "More than one playback device is named \"System\", so I can't guess.");
-                Log("Pick the right one with --target <id>.");
-                PrintList(all);
-                return 3;
-            }
-        }
 
         bool created;
-        using (var mutex = new Mutex(true, "steam-audio-relay", out created))
+        using (var mutex = new Mutex(true, "wavelink-remote-play", out created))
         {
             if (!created) { Log("Already running."); return 1; }
 
-            // sources: explicit ids (comma separated), or all other channels of the target's device
+            // sources: explicit ids (comma separated), or Wave Link's devices
             Func<List<Endpoint>> getSources;
             string srcArg = Arg(args, "--source");
             if (srcArg != null && srcArg != "auto")
@@ -1607,16 +1761,18 @@ static class Relay
             }
             else
             {
-                Endpoint tgt = target;
-                getSources = delegate { return SiblingSources(tgt); };
-                if (getSources().Count == 0) { Log("The target's device has no other playback devices. Pass --source <id>."); return 3; }
+                getSources = delegate { return ChannelDevices(ActiveRenderEndpoints()); };
+                if (getSources().Count == 0) { Log("Found no Wave Link devices (no single playback device called \"System\"). Pass --source <id,id>."); return 3; }
             }
-            Log("To: " + target);
+            Log("To: " + (target != null ? target.ToString() : "whatever device Steam records"));
+            LoadLeftovers();
 
             if (selftest)
             {
+                Endpoint st = target ?? GuessTarget(all);
+                if (st == null) { Log("The self-test needs --target <id>."); return 3; }
                 var until = DateTime.UtcNow.AddSeconds(2);
-                try { RunSession(getSources(), target, () => DateTime.UtcNow < until); Log("Self-test ok."); return 0; }
+                try { RunSession(getSources().FindAll(e => NormGuid(e.Guid) != NormGuid(st.Guid)), st, () => DateTime.UtcNow < until); Log("Self-test ok."); return 0; }
                 catch (Exception e) { Log("Self-test failed: " + e.Message); return 2; }
             }
 
